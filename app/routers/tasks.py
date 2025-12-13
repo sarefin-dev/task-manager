@@ -66,7 +66,7 @@ async def update_task(
 ):
     """Update a task (partial update)"""
     result = await db.exec(select(Task).where(Task.id == task_id))
-    task = result.scalar_one_or_none()
+    task = result.first()
 
     if not task:
         raise HTTPException(
