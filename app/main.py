@@ -1,6 +1,12 @@
 from fastapi import FastAPI
 
 from app.routers import tasks
+from app.cache.layer import cache_layer
+
+
+async def lifespan(app: FastAPI):
+    await cache_layer.init_cache()
+
 
 app = FastAPI(
     title="Task Management API",

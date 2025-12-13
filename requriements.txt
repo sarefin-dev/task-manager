@@ -5,3 +5,5 @@ sqlmodel
 async-lru
 asyncpg
 alembic
+cachetools
+redis

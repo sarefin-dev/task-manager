@@ -5,10 +5,19 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from app.cache.decorators import async_cached
 from app.database import get_db
 from app.models import Task, TaskCreate, TaskResponse, TaskUpdate
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
+
+
+@async_cached(lambda task_id, *_ , **__: f"task:{task_id}", l2_ttl=120)
+async def cached_get_task(task_id: int, db: AsyncSession):
+    print("sdf")
+    result = await db.exec(select(Task).where(Task.id == task_id))
+    task = result.first()
+    return task
 
 
 @router.post("/", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
@@ -49,8 +58,8 @@ async def get_tasks(
 @router.get("/{task_id}", response_model=TaskResponse)
 async def get_task(task_id: int, db: AsyncSession = Depends(get_db)):
     """Get a specific task by ID"""
-    result = await db.execute(select(Task).where(Task.id == task_id))
-    task = result.scalar_one_or_none()
+
+    task = await cached_get_task(task_id, db)
 
     if not task:
         raise HTTPException(
