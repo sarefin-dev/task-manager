@@ -91,7 +91,7 @@ async def update_task(
 async def delete_task(task_id: int, db: AsyncSession = Depends(get_db)):
     """Delete a task"""
     result = await db.exec(select(Task).where(Task.id == task_id))
-    task = result.scalar_one_or_none()
+    task = result.first()
 
     if not task:
         raise HTTPException(
@@ -107,7 +107,7 @@ async def delete_task(task_id: int, db: AsyncSession = Depends(get_db)):
 async def mark_task_complete(task_id: int, db: AsyncSession = Depends(get_db)):
     """Mark a task as completed"""
     result = await db.exec(select(Task).where(Task.id == task_id))
-    task = result.scalar_one_or_none()
+    task = result.first()
 
     if not task:
         raise HTTPException(
