@@ -30,3 +30,16 @@ def async_cached(key_builder: Callable[..., str], l2_ttl: int = None):
         return wrapper
 
     return decorator
+
+
+def async_cached_expire(key_builder: Callable[..., str]):
+    def decorator(fn: Callable):
+        @wraps(fn)
+        async def wrapper(*args, **kwargs):
+            key = key_builder(*args, **kwargs)
+            await cache_layer.delete(key)
+            return await fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
