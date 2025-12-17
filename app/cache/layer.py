@@ -132,16 +132,38 @@ class CacheLayer:
         await self._redis.delete(self._l2_key(key))
 
 
-# simple per-key lock map (in-memory, per-process) - No change needed here for now
-_locks = {}
+# Lock management for cache stampede protection
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# When multiple concurrent requests try to load the same cache key,
+# we use per-key locks to ensure only ONE request hits the database
+# while others wait for the result (thundering herd prevention).
+#
+# Implementation details:
+# • TTLCache provides bounded memory with automatic eviction (maxsize=10k locks)
+# • TTL of 300s (5 min) exceeds worst-case DB operation time to prevent
+#   locks from expiring while operations are in progress
+# • setdefault() ensures atomic lock creation - all concurrent callers
+#   for the same key get the SAME lock object (no race condition)
+# • Locks are automatically cleaned up 300s after last access
+#
+# Memory overhead: ~10KB for full cache (10k locks × ~1KB each)
+_locks = TTLCache(maxsize=10_000, ttl=300)
 
 
-def _get_lock_for_key(key: str):
-    lock = _locks.get(key)
-    if lock is None:
-        lock = asyncio.Lock()
-        _locks[key] = lock
-    return lock
+def _get_lock_for_key(key: str) -> asyncio.Lock:
+    """
+    Get or create an asyncio.Lock for a cache key.
+    
+    Uses atomic setdefault() to prevent race conditions where multiple
+    concurrent requests could create different lock objects for the same key.
+    
+    Args:
+        key: Cache key to get lock for
+        
+    Returns:
+        asyncio.Lock: Shared lock instance for this key
+    """
+    return _locks.setdefault(key, asyncio.Lock())
 
 
 # cache layer instance (singleton per worker)
