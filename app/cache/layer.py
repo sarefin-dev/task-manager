@@ -26,7 +26,7 @@ class CacheLayer:
         """Initializes settings, L1 cache, and the Redis connection."""
         # Load settings asynchronously (only runs the actual fetch once due to alru_cache)
         if self._settings is None:
-            self._settings = await get_settings()
+            self._settings = get_settings()
 
         settings = self._settings  # Alias for convenience
 
@@ -153,13 +153,13 @@ _locks = TTLCache(maxsize=10_000, ttl=300)
 def _get_lock_for_key(key: str) -> asyncio.Lock:
     """
     Get or create an asyncio.Lock for a cache key.
-    
+
     Uses atomic setdefault() to prevent race conditions where multiple
     concurrent requests could create different lock objects for the same key.
-    
+
     Args:
         key: Cache key to get lock for
-        
+
     Returns:
         asyncio.Lock: Shared lock instance for this key
     """

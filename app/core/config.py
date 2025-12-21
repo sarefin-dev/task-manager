@@ -1,7 +1,8 @@
 from pydantic_settings import BaseSettings
-from async_lru import alru_cache
+from functools import lru_cache
 from fastapi import Depends
 from typing_extensions import Annotated
+
 
 class Settings(BaseSettings):
     redis_dsn: str = "redis://localhost:6379/0"
@@ -11,8 +12,8 @@ class Settings(BaseSettings):
     cache_namespace: str = "appcache:"
 
 
-@alru_cache
-async def get_settings():
+@lru_cache
+def get_settings() -> Settings:
     return Settings()
 
 
