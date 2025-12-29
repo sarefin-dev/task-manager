@@ -8,6 +8,41 @@ from redis.asyncio import Redis
 from app.core.config import get_settings
 
 
+class RedisMemoryGuard:
+    def __init__(self, redis: Redis, refresh_interval: int = 5):
+        self.redis = redis
+        self.refresh_interval = refresh_interval
+        self._last_check = 0
+        self._cached = None
+
+    async def check(self) -> dict:
+        now = asyncio.get_event_loop().time()
+        if self._cached and (now - self._last_check) < self.refresh_interval:
+            return self._cached
+
+        info = await self.redis.info("memory")
+        used = info["used_memory"]
+        maxm = info.get("maxmemory", 0)
+
+        if maxm == 0:
+            result = {
+                "level": 0,
+                "ratio": None,
+                "policy": info.get("maxmemory_policy"),
+            }
+        else:
+            ratio = used / maxm
+            result = {
+                "level": int(min(ratio * 10, 10)),
+                "ratio": ratio,
+                "policy": info.get("maxmemory_policy"),
+            }
+
+        self._cached = result
+        self._last_check = now
+        return result
+
+
 class CacheLayer:
     """
     L1 (process-local TTLCache) + L2 (Redis) cache layer.
@@ -18,6 +53,7 @@ class CacheLayer:
         self.loop = loop or asyncio.get_event_loop()
         self._settings = None  # Will hold the Settings object once loaded
         self._redis = None  # Will hold the aioredis connection
+        self._memory_guard = None  # Will handle backpressure
 
         # L1 is initialized as None and will be set in init_cache after settings are loaded
         self.l1: Optional[TTLCache] = None
@@ -39,6 +75,9 @@ class CacheLayer:
             self._redis = Redis.from_url(
                 settings.redis_dsn, encoding="utf-8", decode_responses=True
             )
+
+        if self._memory_guard is None:
+            self._memory_guard = RedisMemoryGuard(self._redis)
 
     def _l1_key(self, key: str) -> str:
         # Use self._settings
@@ -83,6 +122,7 @@ class CacheLayer:
         if loader is None:
             return None
 
+        pressure = await self._memory_guard.check()
         # Stampede Protection Logic (inside lock)
         lock = _get_lock_for_key(key)
         async with lock:
@@ -100,14 +140,33 @@ class CacheLayer:
                 self.l1[key] = value
                 return value
 
+            if pressure["level"] >= 10:
+                return await loader() if loader else None
+
             # call loader
             value = await loader()
             if value is None:
                 return None
 
             # set L2
-            data = json.dumps(value, default=str)
+           
+
             ttl = l2_ttl or settings.l2_ttl_seconds  # Use settings
+
+            pressure = await self._memory_guard.check()
+            pressure_level = pressure["level"]
+            if pressure["level"] >= 9:
+                self.l1[key] = value
+                return value
+
+            if pressure_level >= 7:
+                ttl = min(ttl, 60)
+            elif pressure_level >= 5:
+                ttl = int(ttl * 0.8)
+                ttl = max(ttl, 1)
+            
+            data = json.dumps(value, default=str)
+
             await self._redis.set(self._l2_key(key), data, ex=ttl)
             # set L1
             self.l1[key] = value
@@ -120,13 +179,30 @@ class CacheLayer:
 
         # write-through to both
         self.l1[key] = value
+
+        pressure = await self._memory_guard.check()
+        if pressure["level"] >= 9:
+            return  # skip Redis write
+
         data = json.dumps(value, default=str)
         ttl = l2_ttl or settings.l2_ttl_seconds  # Use settings
+
+        if pressure["level"] >= 7:
+            ttl = min(ttl, 60)
+        elif pressure["level"] >= 5:
+            ttl = int(ttl * 0.8)
+            ttl = max(ttl, 1)
+
         await self._redis.set(self._l2_key(key), data, ex=ttl)
 
     async def delete(self, key: str):
         # Ensure initialization
         await self.init_cache()
+
+        pressure = await self._memory_guard.check()
+        if pressure["level"] >= 10:
+            self.l1.pop(key, None)
+            return
 
         self.l1.pop(key, None)
         await self._redis.delete(self._l2_key(key))
