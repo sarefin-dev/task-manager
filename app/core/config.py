@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     l1_ttl_seconds: int = 60  # default L1 TTL
     l2_ttl_seconds: int = 300  # default Redis TTL
     cache_namespace: str = "appcache:"
+    redis_pool_size: int = 5
 
 
 @lru_cache

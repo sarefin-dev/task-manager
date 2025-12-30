@@ -3,12 +3,27 @@ import json
 from typing import Any, Callable, Optional
 
 from cachetools import TTLCache
-from redis.asyncio import Redis
+from redis.asyncio import Redis, RedisError
 
 from app.core.config import get_settings
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class RedisMemoryGuard:
+    """
+    Monitors Redis memory usage and provides backpressure signals.
+
+    Pressure levels:
+    - 0-4: Normal operation
+    - 5-6: Moderate pressure (reduce TTL by 20%)
+    - 7-8: High pressure (cap TTL at 60s)
+    - 9: Critical (skip Redis writes, L1 only)
+    - 10: Emergency (skip all caching, direct DB)
+    """
+
     def __init__(self, redis: Redis, refresh_interval: int = 5):
         self.redis = redis
         self.refresh_interval = refresh_interval
@@ -16,76 +31,184 @@ class RedisMemoryGuard:
         self._cached = None
 
     async def check(self) -> dict:
+        print("Checking for backpressure...")
+        """Check memory pressure with caching to avoid INFO spam."""
         now = asyncio.get_event_loop().time()
+
+        # Return cached result if within refresh interval
         if self._cached and (now - self._last_check) < self.refresh_interval:
             return self._cached
 
-        info = await self.redis.info("memory")
-        used = info["used_memory"]
-        maxm = info.get("maxmemory", 0)
+        try:
+            info = await self.redis.info("memory")
+            used = info["used_memory"]
+            maxm = info.get("maxmemory", 0)
 
-        if maxm == 0:
-            result = {
-                "level": 0,
-                "ratio": None,
-                "policy": info.get("maxmemory_policy"),
-            }
-        else:
-            ratio = used / maxm
-            result = {
-                "level": int(min(ratio * 10, 10)),
-                "ratio": ratio,
-                "policy": info.get("maxmemory_policy"),
-            }
+            if maxm == 0:
+                # No memory limit configured
+                result = {
+                    "level": 0,
+                    "ratio": None,
+                    "policy": info.get("maxmemory_policy", "noeviction"),
+                    "used_mb": used / (1024 * 1024),
+                }
+            else:
+                ratio = used / maxm
+                result = {
+                    "level": int(min(ratio * 10, 10)),
+                    "ratio": ratio,
+                    "policy": info.get("maxmemory_policy", "noeviction"),
+                    "used_mb": used / (1024 * 1024),
+                    "max_mb": maxm / (1024 * 1024),
+                }
 
-        self._cached = result
-        self._last_check = now
-        return result
+                # Log warnings at high pressure
+                if result["level"] >= 9:
+                    logger.warning(
+                        "Redis memory critical",
+                        level=result["level"],
+                        ratio=f"{ratio:.1%}",
+                        policy=result["policy"],
+                    )
+                elif result["level"] >= 7:
+                    logger.info(
+                        "Redis memory high", level=result["level"], ratio=f"{ratio:.1%}"
+                    )
+
+            self._cached = result
+            self._last_check = now
+            return result
+
+        except RedisError as e:
+            logger.error(f"Memory check failed: {e}")
+            # Return safe default on error
+            return {"level": 0, "ratio": None, "policy": "unknown", "error": str(e)}
 
 
 class CacheLayer:
     """
-    L1 (process-local TTLCache) + L2 (Redis) cache layer.
-    Corrected for async settings loading.
+    Two-tier cache with adaptive backpressure.
+
+    L1: Process-local TTLCache (fast, limited size)
+    L2: Redis (shared, larger capacity)
+
+    Features:
+    - Stampede protection with per-key locks
+    - Adaptive TTL based on Redis memory pressure
+    - Graceful degradation when Redis is unavailable
+    - Automatic key namespacing
     """
 
     def __init__(self, loop=None):
         self.loop = loop or asyncio.get_event_loop()
-        self._settings = None  # Will hold the Settings object once loaded
-        self._redis = None  # Will hold the aioredis connection
-        self._memory_guard = None  # Will handle backpressure
+        self._settings = None
+        self._redis: Redis | None = None
+        self._memory_guard: RedisMemoryGuard | None = None
+        self.l1: TTLCache | None = None
+        self._initialized = False
 
-        # L1 is initialized as None and will be set in init_cache after settings are loaded
-        self.l1: Optional[TTLCache] = None
+        # Stats tracking
+        self.stats = {
+            "l1_hits": 0,
+            "l2_hits": 0,
+            "misses": 0,
+            "errors": 0,
+            "pressure_skips": 0,
+        }
 
     async def init_cache(self):
-        """Initializes settings, L1 cache, and the Redis connection."""
-        # Load settings asynchronously (only runs the actual fetch once due to alru_cache)
-        if self._settings is None:
-            self._settings = get_settings()
+        """Initialize settings, L1 cache, and Redis connection."""
+        if self._initialized:
+            return
 
-        settings = self._settings  # Alias for convenience
+        try:
+            if self._settings is None:
+                self._settings = get_settings()
 
-        # 1. Initialize L1 Cache using loaded settings
-        if self.l1 is None:
-            self.l1 = TTLCache(maxsize=settings.l1_maxsize, ttl=settings.l1_ttl_seconds)
+            settings = self._settings
 
-        # 2. Initialize Redis connection
-        if self._redis is None:
-            self._redis = Redis.from_url(
-                settings.redis_dsn, encoding="utf-8", decode_responses=True
-            )
+            # Initialize L1 Cache
+            if self.l1 is None:
+                self.l1 = TTLCache(
+                    maxsize=settings.l1_maxsize, ttl=settings.l1_ttl_seconds
+                )
 
-        if self._memory_guard is None:
-            self._memory_guard = RedisMemoryGuard(self._redis)
+            # Initialize Redis connection with proper config
+            if self._redis is None:
+                self._redis = Redis.from_url(
+                    settings.redis_dsn,
+                    encoding="utf-8",
+                    decode_responses=True,
+                    max_connections=settings.redis_pool_size,
+                    socket_connect_timeout=5,
+                    socket_keepalive=True,
+                    health_check_interval=30,
+                )
+
+                # Verify connection
+                await self._redis.ping()
+                logger.info("Redis connection established")
+
+            # Initialize memory guard
+            if self._memory_guard is None:
+                self._memory_guard = RedisMemoryGuard(self._redis)
+
+            self._initialized = True
+            logger.info("Cache layer initialized")
+
+        except RedisError as e:
+            logger.error(f"Redis initialization failed: {e}")
+            # Allow degraded operation (L1 only)
+            self._redis = None
+            self._memory_guard = None
+        except Exception as e:
+            logger.error(f"Cache initialization failed: {e}")
+            raise
 
     def _l1_key(self, key: str) -> str:
-        # Use self._settings
+        """Build namespaced L1 cache key."""
         return f"{self._settings.cache_namespace}l1:{key}"
 
     def _l2_key(self, key: str) -> str:
-        # Use self._settings
+        """Build namespaced L2 cache key."""
         return f"{self._settings.cache_namespace}l2:{key}"
+
+    def _serialize(self, value: Any) -> str:
+        """Serialize value for storage."""
+        try:
+            return json.dumps(value, default=str)
+        except (TypeError, ValueError) as e:
+            logger.error(f"Serialization failed: {e}")
+            raise
+
+    def _deserialize(self, raw: str) -> Any:
+        """Deserialize value from storage."""
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            # Return raw string if not valid JSON
+            return raw
+
+    async def _adjust_ttl_for_pressure(self, base_ttl: int) -> int:
+        """Adjust TTL based on current memory pressure."""
+        if not self._memory_guard:
+            return base_ttl
+
+        pressure = await self._memory_guard.check()
+        level = pressure["level"]
+
+        if level >= 9:
+            # Critical: Skip Redis entirely
+            return 0
+        elif level >= 7:
+            # High pressure: Cap at 60s
+            return min(base_ttl, 60)
+        elif level >= 5:
+            # Moderate pressure: Reduce by 20%
+            return max(int(base_ttl * 0.8), 1)
+        else:
+            # Normal operation
+            return base_ttl
 
     async def get(
         self,
@@ -94,118 +217,215 @@ class CacheLayer:
         l2_ttl: Optional[int] = None,
     ):
         """
-        Try L1 -> L2 -> loader (DB).
+        Retrieve value from cache hierarchy: L1 -> L2 -> loader.
+
+        Args:
+            key: Cache key (will be namespaced automatically)
+            loader: Async function to load value on cache miss
+            l2_ttl: TTL for L2 cache in seconds (uses default if None)
+
+        Returns:
+            Cached value or loaded value, or None if not found
         """
-        # Ensure all components are initialized before use
         await self.init_cache()
 
-        # Use alias for convenience
-        settings = self._settings
+        l1_key = self._l1_key(key)
+        l2_key = self._l2_key(key)
 
-        # 1) L1 (sync)
-        if key in self.l1:
-            return self.l1[key]
+        # 1) Check L1 (fast path)
+        if l1_key in self.l1:
+            self.stats["l1_hits"] += 1
+            logger.debug("L1 hit", key=key)
+            return self.l1[l1_key]
 
-        # 2) L2 (redis)
-        raw = await self._redis.get(self._l2_key(key))
-        if raw is not None:
-            # ... (rest of L2 logic is fine)
+        # 2) Check L2 (Redis)
+        if self._redis:
             try:
-                value = json.loads(raw)
-            except Exception:
-                value = raw
-            # update L1
-            self.l1[key] = value
-            return value
+                raw = await self._redis.get(l2_key)
+                if raw is not None:
+                    self.stats["l2_hits"] += 1
+                    logger.debug("L2 hit", key=key)
+                    value = self._deserialize(raw)
+                    # Populate L1
+                    self.l1[l1_key] = value
+                    return value
+            except RedisError as e:
+                logger.error(f"Redis GET error: {e}", key=key)
+                self.stats["errors"] += 1
 
-        # 3) loader fallback
+        # 3) Load from source (with stampede protection)
         if loader is None:
+            self.stats["misses"] += 1
+            logger.debug("Cache miss, no loader", key=key)
             return None
 
-        pressure = await self._memory_guard.check()
-        # Stampede Protection Logic (inside lock)
+        # Check if memory is critical BEFORE acquiring lock
+        if self._memory_guard:
+            pressure = await self._memory_guard.check()
+            if pressure["level"] >= 10:
+                # Emergency: Skip all caching, go direct to DB
+                logger.warning("Emergency mode: direct DB access", key=key)
+                self.stats["pressure_skips"] += 1
+                return await loader()
+
+        # Acquire per-key lock for stampede protection
         lock = _get_lock_for_key(key)
         async with lock:
-            # Double-check L1 and L2 after acquiring lock
-            if key in self.l1:
-                return self.l1[key]
+            # Double-check caches after acquiring lock
+            if l1_key in self.l1:
+                return self.l1[l1_key]
 
-            raw = await self._redis.get(self._l2_key(key))
-            if raw is not None:
-                # ... (L2 logic)
+            if self._redis:
                 try:
-                    value = json.loads(raw)
-                except Exception:
-                    value = raw
-                self.l1[key] = value
-                return value
+                    raw = await self._redis.get(l2_key)
+                    if raw is not None:
+                        value = self._deserialize(raw)
+                        self.l1[l1_key] = value
+                        return value
+                except RedisError as e:
+                    logger.error(f"Redis double-check error: {e}", key=key)
 
-            if pressure["level"] >= 10:
-                return await loader() if loader else None
-
-            # call loader
+            # Load value
+            self.stats["misses"] += 1
+            logger.debug("Loading from source", key=key)
             value = await loader()
+
             if value is None:
                 return None
 
-            # set L2
-           
-
-            ttl = l2_ttl or settings.l2_ttl_seconds  # Use settings
-
-            pressure = await self._memory_guard.check()
-            pressure_level = pressure["level"]
-            if pressure["level"] >= 9:
-                self.l1[key] = value
-                return value
-
-            if pressure_level >= 7:
-                ttl = min(ttl, 60)
-            elif pressure_level >= 5:
-                ttl = int(ttl * 0.8)
-                ttl = max(ttl, 1)
-            
-            data = json.dumps(value, default=str)
-
-            await self._redis.set(self._l2_key(key), data, ex=ttl)
-            # set L1
-            self.l1[key] = value
+            # Store in caches with adaptive TTL
+            await self._set_both_layers(key, value, l2_ttl)
             return value
 
+    async def _set_both_layers(self, key: str, value: Any, l2_ttl: int | None = None):
+        """Internal method to set both cache layers with pressure handling."""
+        l1_key = self._l1_key(key)
+        l2_key = self._l2_key(key)
+
+        # Always set L1 (it's local and fast)
+        self.l1[l1_key] = value
+
+        # Set L2 with adaptive TTL based on pressure
+        if self._redis:
+            try:
+                base_ttl = l2_ttl or self._settings.l2_ttl_seconds
+                ttl = await self._adjust_ttl_for_pressure(base_ttl)
+
+                if ttl == 0:
+                    # Critical pressure: Skip Redis write
+                    logger.debug("Skipping Redis write due to pressure", key=key)
+                    self.stats["pressure_skips"] += 1
+                    return
+
+                data = self._serialize(value)
+                await self._redis.set(l2_key, data, ex=ttl)
+                logger.debug("Stored in L2", key=key, ttl=ttl)
+
+            except RedisError as e:
+                logger.error(f"Redis SET error: {e}", key=key)
+                self.stats["errors"] += 1
+
     async def set(self, key: str, value: Any, l2_ttl: Optional[int] = None):
-        # Ensure initialization
+        """
+        Explicitly set a value in both cache layers.
+
+        Args:
+            key: Cache key (will be namespaced automatically)
+            value: Value to cache
+            l2_ttl: TTL for L2 cache in seconds
+        """
         await self.init_cache()
-        settings = self._settings
-
-        # write-through to both
-        self.l1[key] = value
-
-        pressure = await self._memory_guard.check()
-        if pressure["level"] >= 9:
-            return  # skip Redis write
-
-        data = json.dumps(value, default=str)
-        ttl = l2_ttl or settings.l2_ttl_seconds  # Use settings
-
-        if pressure["level"] >= 7:
-            ttl = min(ttl, 60)
-        elif pressure["level"] >= 5:
-            ttl = int(ttl * 0.8)
-            ttl = max(ttl, 1)
-
-        await self._redis.set(self._l2_key(key), data, ex=ttl)
+        await self._set_both_layers(key, value, l2_ttl)
 
     async def delete(self, key: str):
-        # Ensure initialization
+        """
+        Delete a key from both cache layers.
+
+        Always deletes from both layers, even under pressure.
+        Deleting from Redis is critical to prevent stale data.
+        """
         await self.init_cache()
 
-        pressure = await self._memory_guard.check()
-        if pressure["level"] >= 10:
-            self.l1.pop(key, None)
+        l1_key = self._l1_key(key)
+        l2_key = self._l2_key(key)
+
+        # Always delete from L1
+        self.l1.pop(l1_key, None)
+
+        # Always delete from Redis (critical for consistency)
+        if self._redis:
+            try:
+                await self._redis.delete(l2_key)
+                logger.debug("Deleted from both layers", key=key)
+            except RedisError as e:
+                logger.error(f"Redis DELETE error: {e}", key=key)
+                self.stats["errors"] += 1
+
+    async def delete_pattern(self, pattern: str):
+        """
+        Delete all keys matching a pattern (L2 only).
+
+        L1 is process-local and will expire naturally.
+        """
+        await self.init_cache()
+
+        if not self._redis:
             return
 
-        self.l1.pop(key, None)
-        await self._redis.delete(self._l2_key(key))
+        try:
+            l2_pattern = self._l2_key(pattern)
+            cursor = 0
+            deleted_count = 0
+
+            while True:
+                cursor, keys = await self._redis.scan(
+                    cursor, match=l2_pattern, count=100
+                )
+                if keys:
+                    await self._redis.delete(*keys)
+                    deleted_count += len(keys)
+                if cursor == 0:
+                    break
+
+            logger.info(
+                "Pattern delete completed", pattern=pattern, deleted=deleted_count
+            )
+
+        except RedisError as e:
+            logger.error(f"Pattern delete error: {e}", pattern=pattern)
+            self.stats["errors"] += 1
+
+    async def close(self):
+        """Graceful shutdown of cache connections."""
+        if self._redis:
+            try:
+                await self._redis.aclose()
+                logger.info("Redis connection closed")
+            except Exception as e:
+                logger.error(f"Error closing Redis: {e}")
+
+    def get_stats(self) -> dict:
+        """Get cache statistics including memory pressure."""
+        total = sum(
+            [self.stats["l1_hits"], self.stats["l2_hits"], self.stats["misses"]]
+        )
+
+        stats = {
+            **self.stats,
+            "l1_size": len(self.l1) if self.l1 else 0,
+            "l1_maxsize": self.l1.maxsize if self.l1 else 0,
+            "hit_rate": (
+                (self.stats["l1_hits"] + self.stats["l2_hits"]) / total
+                if total > 0
+                else 0
+            ),
+        }
+
+        # Add current memory pressure if available
+        if self._memory_guard and self._memory_guard._cached:
+            stats["redis_pressure"] = self._memory_guard._cached
+
+        return stats
 
 
 # Lock management for cache stampede protection
@@ -242,5 +462,5 @@ def _get_lock_for_key(key: str) -> asyncio.Lock:
     return _locks.setdefault(key, asyncio.Lock())
 
 
-# cache layer instance (singleton per worker)
+# Cache layer instance (singleton per worker)
 cache_layer = CacheLayer()
